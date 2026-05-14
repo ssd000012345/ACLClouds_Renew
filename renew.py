@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
 ACLClouds 自动续期脚本 (纯 API 版)
-登录流程：
-  1. GET /auth/login  → 获取 XSRF-TOKEN
-  2. POST /auth/captcha → 模拟鼠标行为，获得 captcha_token
-  3. POST /auth/login → 登录
-  4. GET /api/client → 获取项目列表（attributes）
-  5. POST /api/client/servers/{identifier}/upgrade/renew → 续期
+支持 Telegram 和 wxpusher 双推送
 """
 
 import os
@@ -26,10 +21,16 @@ except ImportError:
 # ── 环境变量 ─────────────────────────────────────────────
 EMAIL        = os.environ.get("ACLCLOUDS_EMAIL", "").strip()
 PASSWORD     = os.environ.get("ACLCLOUDS_PASSWORD", "").strip()
+
+# Telegram
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "").strip()
 
-RENEW_THRESHOLD_DAYS = 3   # 剩余天数小于此值时触发续期
+# wxpusher (注意：变量名与你的 Secret 保持一致)
+WXPUSHER_APPTOKEN = os.environ.get("WXPUSHER_APPTOKEN", "").strip()
+WXPUSHER_UID      = os.environ.get("WXPUSHER_UID", "").strip()   # 如果你的 Secret 是 WXPUSHER_UUID，这里也要改成 WXPUSHER_UUID
+
+RENEW_THRESHOLD_DAYS = 3
 
 BASE_URL  = "https://dash.aclclouds.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -51,7 +52,7 @@ def log(msg):       print(f"[INFO] {msg}", flush=True)
 def log_warn(msg):  print(f"[WARN] {msg}", flush=True)
 def log_error(msg): print(f"[ERROR] {msg}", flush=True)
 
-# ── TG 推送 ──────────────────────────────────────────────
+# ── 推送函数 ──────────────────────────────────────────────
 def send_tg(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log_warn("TG 未配置，跳过推送")
@@ -72,17 +73,39 @@ def send_tg(text: str):
     except Exception as e:
         log_warn(f"TG 推送失败: {e}")
 
+def send_wxpusher(text: str):
+    if not WXPUSHER_APPTOKEN or not WXPUSHER_UID:
+        log_warn("wxpusher 未配置，跳过推送")
+        return
+    try:
+        url = "https://wxpusher.zjiecode.com/api/send/message"
+        payload = {
+            "appToken": WXPUSHER_APPTOKEN,
+            "content": text,
+            "summary": "ACLClouds 续期通知",
+            "contentType": 1,
+            "uids": [WXPUSHER_UID],
+        }
+        req = Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        resp = urlopen(req, timeout=15)
+        result = json.loads(resp.read().decode())
+        if result.get("code") == 1000:
+            log("wxpusher 推送成功")
+        else:
+            log_warn(f"wxpusher 返回错误: {result}")
+    except Exception as e:
+        log_warn(f"wxpusher 推送失败: {e}")
+
+def send_all_push(text: str):
+    """同时发送 TG 和 wxpusher"""
+    send_tg(text)
+    send_wxpusher(text)
+
 # ── 解析剩余时间 ──────────────────────────────────────────
 def parse_expires(text):
-    """
-    支持：ISO 日期字符串 / '3j 3h' / '2d 12h' / 纯数字秒
-    返回 float 天数，失败返回 None
-    """
     if text is None:
         return None
     s = str(text).strip()
-
-    # ISO 日期
     if re.search(r'\d{4}-\d{2}-\d{2}', s):
         try:
             from datetime import datetime, timezone
@@ -90,14 +113,10 @@ def parse_expires(text):
             return (dt - datetime.now(timezone.utc)).total_seconds() / 86400
         except Exception:
             pass
-
-    # 纯数字（秒）
     try:
         return float(s) / 86400
     except Exception:
         pass
-
-    # '3j 3h' / '2d 12h'
     sl = s.lower()
     days = hours = minutes = 0.0
     m = re.search(r'(\d+(?:\.\d+)?)\s*[dj]', sl)
@@ -106,7 +125,6 @@ def parse_expires(text):
     if m: hours = float(m.group(1))
     m = re.search(r'(\d+(?:\.\d+)?)\s*m(?!o)', sl)
     if m: minutes = float(m.group(1))
-
     total = days + hours / 24 + minutes / 1440
     return total if total > 0 else None
 
@@ -117,7 +135,6 @@ class ACLCloudsAPI:
         self.session.headers.update(HEADERS)
 
     def _set_xsrf(self):
-        """从 cookie 里取 XSRF-TOKEN，URL decode 后放进请求头"""
         from urllib.parse import unquote
         xsrf = self.session.cookies.get("XSRF-TOKEN", "")
         if xsrf:
@@ -126,14 +143,10 @@ class ACLCloudsAPI:
             log(f"x-xsrf-token 已设置: {decoded[:30]}...")
 
     def _get_captcha_token(self):
-        """
-        通过模拟鼠标行为绕过验证码
-        """
         log("GET 登录页，获取 XSRF-TOKEN ...")
         r = self.session.get(LOGIN_URL, timeout=20)
         r.raise_for_status()
         self._set_xsrf()
-
         captcha_url = f"{BASE_URL}/auth/captcha"
         fake_behavior = {
             "mouse_movements": 320,
@@ -145,7 +158,6 @@ class ACLCloudsAPI:
         log(f"POST {captcha_url} ...")
         cr = self.session.post(captcha_url, json=fake_behavior, timeout=20)
         log(f"  -> HTTP {cr.status_code}")
-
         if cr.status_code == 200:
             data = cr.json()
             log(f"  -> 响应: {data}")
@@ -166,33 +178,22 @@ class ACLCloudsAPI:
 
     def login(self, email, password):
         captcha_token = self._get_captcha_token()
-
         payload = {
             "user":           email,
             "password":       password,
             "captcha_answer": "human",
             "captcha_token":  captcha_token,
         }
-
         log(f"POST {LOGIN_URL}")
-        r = self.session.post(
-            LOGIN_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=20,
-        )
+        r = self.session.post(LOGIN_URL, json=payload, headers={"Content-Type": "application/json"}, timeout=20)
         log(f"登录响应: HTTP {r.status_code}")
-
-        # 更新 XSRF-TOKEN
         self._set_xsrf()
-
         if r.status_code == 200:
             if self.session.cookies.get("aclclouds_session"):
                 log("登录成功 ✅（aclclouds_session 已设置）")
                 return True
             try:
                 data = r.json()
-                log(f"响应 JSON keys: {list(data.keys())}")
                 if data.get("token") or data.get("access_token"):
                     tok = data.get("token") or data.get("access_token")
                     self.session.headers["Authorization"] = f"Bearer {tok}"
@@ -203,12 +204,10 @@ class ACLCloudsAPI:
                     return True
             except Exception:
                 pass
-
         log_error(f"登录失败，响应: {r.text[:300]}")
         raise RuntimeError(f"登录失败，HTTP {r.status_code}")
 
     def get_projects(self):
-        """获取项目列表 - 使用 /api/client，提取 attributes"""
         url = f"{BASE_URL}/api/client"
         log(f"GET {url}")
         r = self.session.get(url, timeout=20)
@@ -216,7 +215,6 @@ class ACLCloudsAPI:
         if r.status_code != 200:
             raise RuntimeError(f"获取项目列表失败 HTTP {r.status_code}")
         data = r.json()
-        # 响应结构: {"object":"list", "data":[{"object":"server","attributes":{...}}]}
         if not isinstance(data, dict) or "data" not in data:
             raise RuntimeError(f"意外的响应结构: {data}")
         projects = []
@@ -228,23 +226,16 @@ class ACLCloudsAPI:
         return projects
 
     def renew_project(self, project):
-        """
-        续期单个项目 - 使用抓包得到的精确接口
-        POST /api/client/servers/{identifier}/upgrade/renew
-        """
         identifier = project.get("identifier")
         if not identifier:
             raise ValueError(f"无法获取 identifier，字段: {list(project.keys())}")
-
         url = f"{API_BASE}/client/servers/{identifier}/upgrade/renew"
         log(f"POST {url}")
         r = self.session.post(url, timeout=20)
         log(f"  → HTTP {r.status_code}")
-
         if r.status_code == 200:
             return True
         else:
-            # 尝试解析错误信息（例如 renew_not_available）
             try:
                 err = r.json()
                 log_warn(f"续期失败: {err}")
@@ -279,10 +270,7 @@ def run():
         remaining = parse_expires(raw_expires)
 
         if remaining is None:
-            log_warn(
-                f"[{name}] 无法解析剩余时间\n"
-                f"  完整数据: {json.dumps(project, ensure_ascii=False, default=str)[:400]}"
-            )
+            log_warn(f"[{name}] 无法解析剩余时间")
             failed_list.append(f"{name}（无法解析过期时间）")
             continue
 
@@ -313,14 +301,14 @@ def run():
         if failed_list:
             lines += ["", "⚠️ 以下项目失败："] + [f"• {i}" for i in failed_list]
         lines += ["", "ACLClouds Auto Renew"]
-        send_tg("\n".join(lines))
+        send_all_push("\n".join(lines))
     elif failed_list:
         lines = ["❌ <b>ACLClouds 续期失败</b>", ""]
         lines += [f"• {i}" for i in failed_list]
         lines += ["", "ACLClouds Auto Renew"]
-        send_tg("\n".join(lines))
+        send_all_push("\n".join(lines))
     else:
-        log("无续期操作，不发送 TG 推送")
+        log("无续期操作，不发送推送")
 
 if __name__ == "__main__":
     try:
@@ -329,7 +317,7 @@ if __name__ == "__main__":
     except Exception:
         log_error("脚本失败")
         traceback.print_exc()
-        send_tg(
+        send_all_push(
             f"❌ <b>ACLClouds 续期脚本异常</b>\n\n"
             f"{traceback.format_exc()[:300]}\n\nACLClouds Auto Renew"
         )
