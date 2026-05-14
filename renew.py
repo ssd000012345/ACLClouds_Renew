@@ -2,12 +2,11 @@
 """
 ACLClouds 自动续期脚本 (纯 API 版)
 登录流程：
-  1. GET /auth/login  → 从 HTML 里提取 captcha_token (已通过 /auth/captcha 模拟绕过)
-  2. POST /auth/login → { user, password, captcha_answer: "human", captcha_token }
-  3. 拿到 session cookie，后续请求全带上
-
-项目列表 API: GET /api/client
-续期 API: 需要手动抓包确定（脚本内置了几个常见候选）
+  1. GET /auth/login  → 获取 XSRF-TOKEN
+  2. POST /auth/captcha → 模拟鼠标行为，获得 captcha_token
+  3. POST /auth/login → 登录
+  4. GET /api/client → 获取项目列表（attributes）
+  5. POST /api/client/servers/{identifier}/upgrade/renew → 续期
 """
 
 import os
@@ -30,7 +29,7 @@ PASSWORD     = os.environ.get("ACLCLOUDS_PASSWORD", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "").strip()
 
-RENEW_THRESHOLD_DAYS = 3
+RENEW_THRESHOLD_DAYS = 3   # 剩余天数小于此值时触发续期
 
 BASE_URL  = "https://dash.aclclouds.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -209,7 +208,7 @@ class ACLCloudsAPI:
         raise RuntimeError(f"登录失败，HTTP {r.status_code}")
 
     def get_projects(self):
-        """获取项目列表 - 使用 /api/client"""
+        """获取项目列表 - 使用 /api/client，提取 attributes"""
         url = f"{BASE_URL}/api/client"
         log(f"GET {url}")
         r = self.session.get(url, timeout=20)
@@ -229,41 +228,30 @@ class ACLCloudsAPI:
         return projects
 
     def renew_project(self, project):
-        """续期单个项目 - 内置常见续期端点候选"""
-        # 可能的ID字段
-        pid = (
-            project.get("identifier") or
-            project.get("internal_id") or
-            project.get("id") or
-            project.get("uuid")
-        )
-        if not pid:
-            raise ValueError(f"无法获取项目 ID，字段: {list(project.keys())}")
+        """
+        续期单个项目 - 使用抓包得到的精确接口
+        POST /api/client/servers/{identifier}/upgrade/renew
+        """
+        identifier = project.get("identifier")
+        if not identifier:
+            raise ValueError(f"无法获取 identifier，字段: {list(project.keys())}")
 
-        # 候选续期端点（按常见模式，需要根据实际抓包调整）
-        candidates = [
-            (f"{API_BASE}/servers/{pid}/renew", "POST"),
-            (f"{API_BASE}/client/{pid}/renew", "POST"),
-            (f"{API_BASE}/projects/{pid}/renew", "POST"),
-            (f"{API_BASE}/renew", "POST"),  # body: {"server_id": pid}
-        ]
-        for ep, method in candidates:
+        url = f"{API_BASE}/client/servers/{identifier}/upgrade/renew"
+        log(f"POST {url}")
+        r = self.session.post(url, timeout=20)
+        log(f"  → HTTP {r.status_code}")
+
+        if r.status_code == 200:
+            return True
+        else:
+            # 尝试解析错误信息（例如 renew_not_available）
             try:
-                body = {}
-                if ep.endswith("/renew") and pid not in ep:
-                    body = {"server_id": pid}  # 常见传参方式
-                log(f"  尝试 {method} {ep}")
-                fn = self.session.post if method == "POST" else self.session.put
-                r = fn(ep, json=body, timeout=20)
-                log(f"    → HTTP {r.status_code}")
-                if r.status_code in (200, 201, 204):
-                    return True
-                if r.status_code == 404:
-                    continue
-            except Exception as e:
-                log_warn(f"    → 异常: {e}")
-
-        raise RuntimeError(f"项目 {pid} 所有续期端点均失败，请手动抓包续期接口")
+                err = r.json()
+                log_warn(f"续期失败: {err}")
+                raise RuntimeError(f"续期失败: {err.get('error', 'unknown')}")
+            except:
+                log_warn(f"续期失败，HTTP {r.status_code}, body: {r.text[:200]}")
+                raise RuntimeError(f"续期失败，HTTP {r.status_code}")
 
 # ── 主流程 ────────────────────────────────────────────────
 def run():
@@ -285,19 +273,8 @@ def run():
     failed_list  = []
 
     for project in projects:
-        name = (
-            project.get("name") or project.get("title") or
-            project.get("label") or project.get("hostname") or
-            str(project.get("id", "未知"))
-        )
-        raw_expires = (
-            project.get("expires_at") or project.get("expiry") or
-            project.get("expiration") or project.get("expire_at") or
-            project.get("expires") or project.get("remaining") or
-            project.get("time_left") or project.get("timeLeft") or
-            project.get("remainingTime") or project.get("expiresAt")
-        )
-
+        name = project.get("name", "未知项目")
+        raw_expires = project.get("expires_at")
         log(f"[{name}] 过期数据: {raw_expires!r}")
         remaining = parse_expires(raw_expires)
 
