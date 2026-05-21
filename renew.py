@@ -20,6 +20,36 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
     import requests
 
+def take_screenshot(cookies: dict, label: str = "projects"):
+    """用 Playwright 截取项目列表页，保存到 screenshots/ 目录"""
+    try:
+        from playwright.sync_api import sync_playwright
+        os.makedirs("screenshots", exist_ok=True)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+            ctx = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=HEADERS["User-Agent"],
+            )
+            # 把 requests session 的 cookie 注入浏览器
+            for name, value in cookies.items():
+                try:
+                    ctx.add_cookies([{
+                        "name": name, "value": value,
+                        "domain": "dash.aclclouds.com", "path": "/",
+                    }])
+                except Exception:
+                    pass
+            page = ctx.new_page()
+            page.goto("https://dash.aclclouds.com/projects", timeout=30000)
+            page.wait_for_timeout(3000)
+            path = f"screenshots/{label}.png"
+            page.screenshot(path=path, full_page=True)
+            log(f"截图已保存: {path}")
+            browser.close()
+    except Exception as e:
+        log_warn(f"截图失败（不影响续期）: {e}")
+
 # ── 环境变量 ─────────────────────────────────────────────
 EMAIL        = os.environ.get("ACLCLOUDS_EMAIL", "").strip()
 PASSWORD     = os.environ.get("ACLCLOUDS_PASSWORD", "").strip()
@@ -285,6 +315,9 @@ def run():
         return
 
     log(f"共 {len(projects)} 个项目")
+
+    # 截图：登录后项目列表页
+    take_screenshot(dict(api.session.cookies), label="before_renew")
 
     renewed_list = []
     skipped_list = []
